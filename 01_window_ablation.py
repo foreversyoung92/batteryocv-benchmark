@@ -1,0 +1,182 @@
+# %%
+"""
+Window size ablation (Stage 1).
+
+Reproduces Table 3 (paper §5.2): Conv AE with voltage-only input,
+varying W in {1, 16, 32, 64} at seed 42.
+
+Outputs
+-------
+stage1_window_ablation/
+    Per-W subdirectories with checkpoints, evaluation summaries,
+    and an aggregate `window_ablation_summary.csv`.
+"""
+
+from __future__ import annotations
+
+import time
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+
+from pipeline import (
+    RANDOM_SEED, USE_HALF_PROFILE, BATCH_SIZE, NUM_WORKERS,
+    DB_ROOT_PUBLIC_H5, SPLIT_JSON_PATH,
+    set_seed, ensure_dir, build_dataloaders,
+    AELossConfig, AELoss, train_one_epoch, validate_one_epoch,
+    save_ckpt_ae, load_ckpt_ae, evaluate_ae_predictions_aux,
+    plot_loss_components, compute_objective_metric, PROFILE_RMSE_SCALE,
+)
+from models import build_model, count_parameters
+
+# =========================================================
+# STAGE 1: Window ablation first, voltage-only input
+# =========================================================
+VARIANT = "voltage"
+WINDOW_SIZES = [1, 16, 32, 64]
+
+USE_SEG_BIAS = False
+USE_DIFF_LOSS = False
+
+LAMBDA_P = 100.0
+LAMBDA_D = 0.0
+LAMBDA_C = 5.0
+
+LATENT_DIM = 128
+AUX_EMBED_DIM = 8
+LR = 1e-3
+WEIGHT_DECAY = 1e-2
+FULL_EPOCHS = 3000
+
+RESULT_DIR = Path("stage1_window_ablation")
+
+
+def make_loss_fn() -> tuple[AELossConfig, AELoss]:
+    cfg = AELossConfig(
+        prof_weight=LAMBDA_P,
+        diff_weight=LAMBDA_D,
+        cap_weight=LAMBDA_C,
+        cap_loss_type="smoothl1",
+        use_diff_loss=USE_DIFF_LOSS,
+    )
+    return cfg, AELoss(cfg)
+
+
+def run_window(window_size: int, device: torch.device) -> dict:
+    print(f"\n{'='*80}\n[Stage 1 WINDOW] W={window_size} | voltage-only | seg={USE_SEG_BIAS} diff={USE_DIFF_LOSS}\n{'='*80}")
+    set_seed(RANDOM_SEED)
+    bundle = build_dataloaders(
+        variant=VARIANT,
+        window_size=window_size,
+        use_half_profile=USE_HALF_PROFILE,
+        batch_size=BATCH_SIZE,
+        num_workers=NUM_WORKERS,
+        split_json_path=SPLIT_JSON_PATH,
+        h5_path=DB_ROOT_PUBLIC_H5,
+    )
+
+    model = build_model(
+        model_type="conv",
+        profile_len=bundle["profile_len"],
+        window_size=window_size,
+        in_channels=bundle["in_channels"],
+        aux_dim=bundle["aux_dim"],
+        latent_dim=LATENT_DIM,
+        aux_embed_dim=AUX_EMBED_DIM,
+        out_activation="sigmoid",
+        use_segment_bias=USE_SEG_BIAS,
+    ).to(device)
+    n_params = count_parameters(model)
+    loss_cfg, loss_fn = make_loss_fn()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, betas=(0.9, 0.95), weight_decay=WEIGHT_DECAY)
+
+    ckpt_dir = RESULT_DIR / f"W{window_size:03d}"
+    ensure_dir(ckpt_dir)
+    ckpt_best = ckpt_dir / "best.pt"
+    log_csv = ckpt_dir / "train_log.csv"
+    best_val_rmse = float("inf")
+    best_epoch = 0
+    train_history, val_history = [], []
+    t0 = time.time()
+
+    for epoch in range(1, FULL_EPOCHS + 1):
+        train_metrics = train_one_epoch(model, bundle["train_loader"], optimizer, loss_fn, device)
+        val_metrics = validate_one_epoch(model, bundle["val_loader"], loss_fn, device)
+        val_prof_rmse = float((val_metrics["loss_prof_scaled"] / max(LAMBDA_P, 1e-6)) ** 0.5)
+        train_history.append(train_metrics)
+        val_history.append(val_metrics)
+
+        if val_prof_rmse < best_val_rmse:
+            best_val_rmse = val_prof_rmse
+            best_epoch = epoch
+            save_ckpt_ae(
+                ckpt_best, epoch, model, optimizer, train_history, val_history,
+                best_val_rmse, loss_cfg,
+                extra={"stage": "1", "variant": VARIANT, "window_size": window_size, "best_epoch": epoch},
+            )
+
+        pd.DataFrame([{
+            "epoch": epoch, "window_size": window_size,
+            **{f"train_{k}": v for k, v in train_metrics.items()},
+            **{f"val_{k}": v for k, v in val_metrics.items()},
+            "val_prof_rmse": val_prof_rmse, "best_val_rmse": best_val_rmse,
+        }]).to_csv(log_csv, mode="a", header=not log_csv.exists(), index=False)
+
+        if epoch % 500 == 0 or epoch == 1:
+            print(f"  [W={window_size}][{epoch:04d}] train_prof={train_metrics['loss_prof_scaled']:.4f} | val_rmse={val_prof_rmse:.6f} | best={best_val_rmse:.6f}")
+
+    elapsed_min = (time.time() - t0) / 60
+    plot_loss_components(train_history, val_history)
+    load_ckpt_ae(ckpt_best, model=model, device=device)
+    model.eval()
+
+    results = evaluate_ae_predictions_aux(
+        model=model,
+        X_main=bundle["X_main_test"], X_aux=bundle["X_aux_test"],
+        Yprof=bundle["Y_prof_test"], Ycap=bundle["Y_cap_test"],
+        device=device, meta_val=bundle["meta_test"],
+        charge_len=64, prominence=0.02,
+        charge_peak_ylim=(0, 2), discharge_peak_ylim=(-2, 0),
+        plot_best_worst_cell_profile=True, plot_cap_scatter=True,
+        plot_best_worst_cap_aligned_profile=True, plot_best_worst_peak=True,
+        plot_one_cell_trend=False, plot_all_cell_trends=False,
+        plot_cell_slope_scatter=True,
+        save_dir=ckpt_dir / "evaluation",
+        result_csv_name="evaluation_summary.csv",
+        cell_csv_name="evaluation_per_cell.csv",
+        sample_csv_name="evaluation_per_sample.csv",
+    )
+    test_obj = compute_objective_metric(
+        model=model,
+        X_main=bundle["X_main_test"], X_aux=bundle["X_aux_test"],
+        Y_prof=bundle["Y_prof_test"], Y_cap=bundle["Y_cap_test"], device=device,
+    )
+    summary = results.get("summary_df", pd.DataFrame())
+    row = {
+        "stage": "1", "variant": VARIANT, "window_size": window_size,
+        "n_params": n_params, "best_val_rmse": best_val_rmse,
+        "best_epoch": best_epoch, "elapsed_min": round(elapsed_min, 2),
+        "test_objective": test_obj,
+    }
+    if len(summary):
+        for col in summary.columns:
+            if col not in ["best_cell", "worst_cell"]:
+                row[col] = summary.iloc[0][col]
+    print(f"  [W={window_size}] test_objective={test_obj:.4f}")
+    return row
+
+
+set_seed(RANDOM_SEED)
+ensure_dir(RESULT_DIR)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Device: {device}")
+print(f"Objective = M_cnt + 10*M_pos + 5*M_cap + 30*M_profile")
+
+rows = [run_window(W, device) for W in WINDOW_SIZES]
+df = pd.DataFrame(rows).sort_values("test_objective").reset_index(drop=True)
+df.to_csv(RESULT_DIR / "window_ablation_summary.csv", index=False)
+print(df)
+print(f"\n[DONE] Saved to: {RESULT_DIR}")
+

@@ -1,0 +1,12 @@
+BatteryOCV.h5
+BatteryOCV_split.json
+stage1_window_ablation/
+stage2_design_ablation/
+stage3_input_ablation/
+stage4_architecture_comparison/
+stage5_generative_baselines/
+__pycache__/
+*.pyc
+inspect_data.png
+.vscode/
+*.log
